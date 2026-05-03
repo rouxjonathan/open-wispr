@@ -241,6 +241,90 @@ final class ConfigTests: XCTestCase {
         let config = HotkeyConfig(keyCode: 49, modifiers: ["cmd", "bogus"])
         XCTAssertEqual(config.modifierFlags, UInt64(1 << 20))
     }
+
+    // MARK: - Prompt + replacements
+
+    func testConfigDecodesPrompt() throws {
+        let json = """
+        {
+            "hotkey": {"keyCode": 63, "modifiers": []},
+            "modelSize": "base.en",
+            "language": "en",
+            "prompt": "Claude, Anthropic"
+        }
+        """.data(using: .utf8)!
+        let config = try Config.decode(from: json)
+        XCTAssertEqual(config.prompt, "Claude, Anthropic")
+    }
+
+    func testConfigDecodesReplacements() throws {
+        let json = """
+        {
+            "hotkey": {"keyCode": 63, "modifiers": []},
+            "modelSize": "base.en",
+            "language": "en",
+            "replacements": [["cloud code", "Claude code"], ["a", "b"]]
+        }
+        """.data(using: .utf8)!
+        let config = try Config.decode(from: json)
+        XCTAssertEqual(config.replacements?.count, 2)
+        XCTAssertEqual(config.replacements?[0], ["cloud code", "Claude code"])
+    }
+
+    func testConfigDecodesWithoutPromptOrReplacements() throws {
+        let json = """
+        {
+            "hotkey": {"keyCode": 63, "modifiers": []},
+            "modelSize": "base.en",
+            "language": "en"
+        }
+        """.data(using: .utf8)!
+        let config = try Config.decode(from: json)
+        XCTAssertNil(config.prompt)
+        XCTAssertNil(config.replacements)
+    }
+
+    func testEstimatedPromptTokensNilOrEmpty() {
+        XCTAssertEqual(Config.estimatedPromptTokens(nil), 0)
+        XCTAssertEqual(Config.estimatedPromptTokens(""), 0)
+        XCTAssertEqual(Config.estimatedPromptTokens("   "), 0)
+    }
+
+    func testEstimatedPromptTokensShortPrompt() {
+        let count = Config.estimatedPromptTokens("Claude Anthropic Cursor")
+        XCTAssertGreaterThanOrEqual(count, 3)
+        XCTAssertLessThanOrEqual(count, 8)
+    }
+
+    func testEstimatedPromptTokensCharsDominate() {
+        let count = Config.estimatedPromptTokens("supercalifragilisticexpialidocious")
+        XCTAssertGreaterThan(count, 1)
+    }
+
+    func testNormalizedReplacementsFiltersMalformed() {
+        let pairs: [[String]] = [
+            ["a", "b"],
+            ["", "x"],
+            ["solo"],
+            ["one", "two", "three"],
+            ["c", "d"],
+        ]
+        let normalized = Config.normalizedReplacements(pairs)
+        XCTAssertEqual(normalized.count, 2)
+        XCTAssertEqual(normalized[0].0, "a")
+        XCTAssertEqual(normalized[1].0, "c")
+    }
+
+    func testNormalizedReplacementsNil() {
+        XCTAssertEqual(Config.normalizedReplacements(nil).count, 0)
+    }
+
+    func testDefaultConfigHasPromptAndReplacements() {
+        XCTAssertNotNil(Config.defaultConfig.prompt)
+        XCTAssertFalse(Config.defaultConfig.prompt?.isEmpty ?? true)
+        XCTAssertNotNil(Config.defaultConfig.replacements)
+        XCTAssertFalse(Config.defaultConfig.replacements?.isEmpty ?? true)
+    }
 }
 
 private struct FlexBoolWrapper: Codable {

@@ -39,6 +39,24 @@ public struct TextPostProcessor {
         return result
     }
 
+    public static func applyReplacements(_ text: String, replacements: [(String, String)]) -> String {
+        guard !replacements.isEmpty else { return text }
+        var result = text
+        for (from, to) in replacements {
+            guard !from.isEmpty else { continue }
+            let escapedFrom = NSRegularExpression.escapedPattern(for: from)
+            let pattern = "\\b\(escapedFrom)\\b"
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { continue }
+            let escapedTo = NSRegularExpression.escapedTemplate(for: to)
+            result = regex.stringByReplacingMatches(
+                in: result,
+                range: NSRange(result.startIndex..., in: result),
+                withTemplate: escapedTo
+            )
+        }
+        return result
+    }
+
     private static func fixSpacingAroundPunctuation(_ text: String) -> String {
         var result = text
         guard let regex = try? NSRegularExpression(pattern: "\\s+([.,?!:;])", options: []) else { return result }

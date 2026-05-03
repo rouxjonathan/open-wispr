@@ -126,6 +126,18 @@ class StatusBarController: NSObject {
             stateMenuItem = stateItem
         }
 
+        let promptTokens = Config.estimatedPromptTokens(config.prompt)
+        if promptTokens > 0 {
+            let warn = promptTokens >= Config.promptTokenWarnThreshold ? "⚠️ " : ""
+            let promptItem = NSMenuItem(
+                title: "\(warn)Prompt: ≈\(promptTokens) / \(Config.promptTokenLimit) tokens",
+                action: nil,
+                keyEquivalent: ""
+            )
+            promptItem.isEnabled = false
+            menu.addItem(promptItem)
+        }
+
         menu.addItem(NSMenuItem.separator())
 
         let currentLang = config.language

@@ -14,6 +14,28 @@ public struct Config: Codable {
     public var maxRecordings: Int?
     public var toggleMode: FlexBool?
     public var audioInputDeviceID: UInt32?
+    public var prompt: String?
+    public var replacements: [[String]]?
+
+    public static let promptTokenLimit: Int = 224
+    public static let promptTokenWarnThreshold: Int = 200
+
+    public static func estimatedPromptTokens(_ prompt: String?) -> Int {
+        guard let prompt = prompt?.trimmingCharacters(in: .whitespacesAndNewlines), !prompt.isEmpty else {
+            return 0
+        }
+        let words = prompt.split(whereSeparator: { $0.isWhitespace }).count
+        let chars = prompt.count
+        return max(words, Int((Double(chars) / 3.5).rounded(.up)))
+    }
+
+    public static func normalizedReplacements(_ pairs: [[String]]?) -> [(String, String)] {
+        guard let pairs = pairs else { return [] }
+        return pairs.compactMap { pair in
+            guard pair.count == 2, !pair[0].isEmpty else { return nil }
+            return (pair[0], pair[1])
+        }
+    }
 
     public static let supportedLanguages: [LanguageOption] = [
         LanguageOption(code: "auto", name: "Auto-Detect"),
@@ -158,7 +180,14 @@ public struct Config: Codable {
         language: "en",
         spokenPunctuation: FlexBool(false),
         maxRecordings: nil,
-        toggleMode: FlexBool(false)
+        toggleMode: FlexBool(false),
+        audioInputDeviceID: nil,
+        prompt: "Claude, Anthropic, Cursor, Codex, MCP, TypeScript, npm, GitHub",
+        replacements: [
+            ["cloud code", "Claude code"],
+            ["anthropique", "Anthropic"],
+            ["vs code", "VS Code"],
+        ]
     )
 
     public static var configDir: URL {
