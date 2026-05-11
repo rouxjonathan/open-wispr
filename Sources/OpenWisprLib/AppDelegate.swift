@@ -113,6 +113,10 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
 
         recorder.prewarm()
 
+        // Load the whisper model into memory now so the first dictation pays
+        // only the encode/decode cost, not the ~600ms model load.
+        transcriber.prewarmEngine()
+
         DispatchQueue.main.async { [weak self] in
             self?.startListening()
         }
@@ -163,6 +167,11 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         transcriber.spokenPunctuation = config.spokenPunctuation?.value ?? false
         transcriber.prompt = config.prompt
         inserter = TextInserter()
+
+        // Reload the whisper model in the background — it can be hundreds of MB.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.transcriber.prewarmEngine()
+        }
 
         hotkeyManager?.stop()
         hotkeyManager = HotkeyManager(

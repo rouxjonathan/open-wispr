@@ -6,12 +6,64 @@ public class Transcriber {
     public var spokenPunctuation: Bool = false
     public var prompt: String?
 
+    /// In-process whisper engine. Created lazily on first transcribe so model
+    /// load happens in the background (caller can prewarm by calling
+    /// `prewarmEngine()` after init). If init fails (e.g. libwhisper missing),
+    /// we transparently fall back to spawning whisper-cli.
+    private var engine: WhisperEngine?
+    private var engineInitTried = false
+    private let engineLock = NSLock()
+
     public init(modelSize: String = "base.en", language: String = "en") {
         self.modelSize = modelSize
         self.language = language
     }
 
+    /// Pre-load the model into memory. Safe to call multiple times.
+    /// Call from a background queue at app startup or after a model change.
+    public func prewarmEngine() {
+        _ = ensureEngine()
+    }
+
+    private func ensureEngine() -> WhisperEngine? {
+        engineLock.lock()
+        defer { engineLock.unlock() }
+
+        if let engine = engine { return engine }
+        if engineInitTried { return nil }
+        engineInitTried = true
+
+        guard let modelPath = Transcriber.findModel(modelSize: modelSize) else { return nil }
+        let started = Date()
+        guard let engine = WhisperEngine(modelPath: modelPath, modelSize: modelSize) else {
+            fputs("whisper engine: in-process init failed, will fall back to whisper-cli subprocess\n", Foundation.stderr)
+            return nil
+        }
+        let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+        print("whisper engine: model loaded in \(elapsed)ms (\(modelSize))")
+        self.engine = engine
+        return engine
+    }
+
     public func transcribe(audioURL: URL) throws -> String {
+        if let engine = ensureEngine() {
+            return try transcribeInProcess(engine: engine, audioURL: audioURL)
+        }
+        return try transcribeViaSubprocess(audioURL: audioURL)
+    }
+
+    private func transcribeInProcess(engine: WhisperEngine, audioURL: URL) throws -> String {
+        let samples = try WAVDecoder.loadAsFloat32(url: audioURL)
+        let raw = try engine.transcribe(
+            samples: samples,
+            language: language,
+            prompt: prompt,
+            suppressRegex: spokenPunctuation ? "[,\\.\\?!;:\\-—]" : nil
+        )
+        return Transcriber.stripWhisperMarkers(raw)
+    }
+
+    private func transcribeViaSubprocess(audioURL: URL) throws -> String {
         guard let whisperPath = Transcriber.findWhisperBinary() else {
             throw TranscriberError.whisperNotFound
         }
