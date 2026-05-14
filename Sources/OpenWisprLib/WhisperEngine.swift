@@ -89,6 +89,16 @@ final class WhisperEngine {
             ("prompt_len", trimmedPrompt?.count ?? 0),
             ("suppress_regex_len", suppressRegex?.count ?? 0),
         ]))
+
+        // whisper_full_with_state segfaults inside whisper_encode_internal when
+        // given zero samples (deref of buf.baseAddress which is nil for an
+        // empty Array). This happens on accidental ultra-short taps where the
+        // tap callback never fired. Short-circuit cleanly with an empty
+        // transcript instead of taking down the app.
+        if samples.isEmpty {
+            Logger.shared.log("whisper", "transcribe_skip reason=empty_samples")
+            return ""
+        }
         let t0 = Date()
 
         return try language.withCString { langPtr -> String in

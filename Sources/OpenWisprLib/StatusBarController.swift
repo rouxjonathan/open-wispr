@@ -339,6 +339,8 @@ class StatusBarController: NSObject {
         openItem.target = self
         menu.addItem(openItem)
 
+        menu.addItem(NSMenuItem.separator())
+
         let journalItem = NSMenuItem(title: "Open Journal", action: #selector(openJournal), keyEquivalent: "j")
         journalItem.target = self
         menu.addItem(journalItem)
