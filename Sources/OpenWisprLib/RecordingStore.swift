@@ -82,30 +82,37 @@ public class RecordingStore {
         }
     }
 
+    public static func ensureDebugDirectory() {
+        try? FileManager.default.createDirectory(at: debugRecordingsDir, withIntermediateDirectories: true)
+    }
+
     /// Copy a recording into the rolling debug-recordings folder and prune to
     /// `debugMaxRecordings`. Independent of the user's `maxRecordings` setting
     /// so we always have the last few WAVs to listen to when diagnosing a
-    /// dropped dictation. Failures are logged, never propagated.
-    public static func archiveForDebug(_ source: URL) {
+    /// dropped dictation. The dictation ID is embedded in the filename so the
+    /// WAV can be matched back to its entries in the journal. Failures are
+    /// logged, never propagated.
+    @discardableResult
+    public static func archiveForDebug(_ source: URL, id: String) -> URL? {
         let fm = FileManager.default
         do {
             try fm.createDirectory(at: debugRecordingsDir, withIntermediateDirectories: true)
         } catch {
-            Logger.shared.log("recorder", "debug_archive_mkdir_failed err=\(error.localizedDescription)")
-            return
+            Logger.shared.log("recorder", "debug_archive_mkdir_failed id=\(id) err=\(error.localizedDescription)")
+            return nil
         }
 
         let timestamp = dateFormatter.string(from: Date())
-        let unique = String(UUID().uuidString.prefix(8))
-        let dest = debugRecordingsDir.appendingPathComponent("debug-\(timestamp)-\(unique).\(fileExtension)")
+        let dest = debugRecordingsDir.appendingPathComponent("debug-\(timestamp)-\(id).\(fileExtension)")
         do {
             try fm.copyItem(at: source, to: dest)
         } catch {
-            Logger.shared.log("recorder", "debug_archive_copy_failed src=\(source.path) err=\(error.localizedDescription)")
-            return
+            Logger.shared.log("recorder", "debug_archive_copy_failed id=\(id) src=\(source.path) err=\(error.localizedDescription)")
+            return nil
         }
 
         pruneDebug()
+        return dest
     }
 
     private static func pruneDebug() {

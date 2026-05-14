@@ -55,6 +55,18 @@ public final class Logger {
         }
     }
 
+    /// Write a horizontal divider with no timestamp. Used to visually separate
+    /// dictation sessions in the journal so consecutive blocks are easy to scan.
+    public func separator() {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            let line = "\n" + String(repeating: "-", count: 100) + "\n"
+            guard let data = line.data(using: .utf8) else { return }
+            self.handle?.write(data)
+            self.currentSize += data.count
+        }
+    }
+
     private func openFile() {
         let fm = FileManager.default
         try? fm.createDirectory(at: Config.configDir, withIntermediateDirectories: true)

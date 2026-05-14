@@ -12,6 +12,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     public var lastTranscription: String?
     private var systemObservers: SystemObservers?
     private var lastHotkeyDownAt: Date?
+    private var currentDictationID: String?
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
         Logger.shared.log("lifecycle", "applicationDidFinishLaunching")
@@ -264,8 +265,12 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         guard !isPressed else { return }
         isPressed = true
         lastHotkeyDownAt = Date()
+        let id = String(UUID().uuidString.prefix(8)).uppercased()
+        currentDictationID = id
+        Logger.shared.separator()
         let isTemp = Config.effectiveMaxRecordings(config.maxRecordings) == 0
         Logger.shared.log("recording", "start_enter " + logfmt([
+            ("id", id),
             ("temp_mode", isTemp),
         ]))
         statusBar.state = .recording
@@ -277,9 +282,15 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
                 outputURL = RecordingStore.newRecordingURL()
             }
             try recorder.startRecording(to: outputURL)
-            Logger.shared.log("recording", "start_ok url=\(outputURL.path)")
+            Logger.shared.log("recording", "start_ok " + logfmt([
+                ("id", id),
+                ("url", outputURL.path),
+            ]))
         } catch {
-            Logger.shared.log("recording", "start_error err=\(error.localizedDescription)")
+            Logger.shared.log("recording", "start_error " + logfmt([
+                ("id", id),
+                ("err", error.localizedDescription),
+            ]))
             print("Error: \(error.localizedDescription)")
             isPressed = false
             statusBar.state = .idle
@@ -289,19 +300,31 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     private func handleRecordingStop() {
         guard isPressed else { return }
         isPressed = false
+        let id = currentDictationID ?? "UNKNOWN"
         let downAt = lastHotkeyDownAt
         let holdMs: Int = downAt.map { Int(Date().timeIntervalSince($0) * 1000) } ?? -1
-        Logger.shared.log("recording", "stop_enter " + logfmt([("hold_ms", holdMs)]))
+        Logger.shared.log("recording", "stop_enter " + logfmt([
+            ("id", id),
+            ("hold_ms", holdMs),
+        ]))
 
         guard let audioURL = recorder.stopRecording() else {
-            Logger.shared.log("recording", "stop_no_url reason=recorder_returned_nil")
+            Logger.shared.log("recording", "stop_no_url " + logfmt([
+                ("id", id),
+                ("reason", "recorder_returned_nil"),
+            ]))
             statusBar.state = .idle
             return
         }
 
         // Archive a copy independently of the user's maxRecordings setting so we
         // always have the last 5 raw WAVs to listen back when diagnosing.
-        RecordingStore.archiveForDebug(audioURL)
+        if let archived = RecordingStore.archiveForDebug(audioURL, id: id) {
+            Logger.shared.log("recorder", "debug_archived " + logfmt([
+                ("id", id),
+                ("wav", archived.lastPathComponent),
+            ]))
+        }
 
         statusBar.state = .transcribing
 

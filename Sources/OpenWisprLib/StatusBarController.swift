@@ -343,6 +343,10 @@ class StatusBarController: NSObject {
         journalItem.target = self
         menu.addItem(journalItem)
 
+        let debugRecItem = NSMenuItem(title: "Open Debug Recordings", action: #selector(openDebugRecordings), keyEquivalent: "")
+        debugRecItem.target = self
+        menu.addItem(debugRecItem)
+
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
@@ -371,6 +375,11 @@ class StatusBarController: NSObject {
             fm.createFile(atPath: url.path, contents: nil)
         }
         NSWorkspace.shared.open(url)
+    }
+
+    @objc private func openDebugRecordings() {
+        RecordingStore.ensureDebugDirectory()
+        NSWorkspace.shared.open(RecordingStore.debugRecordingsDir)
     }
 
     private func updateIcon() {
