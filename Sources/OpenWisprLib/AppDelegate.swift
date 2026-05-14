@@ -10,8 +10,11 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     var isPressed = false
     var isReady = false
     public var lastTranscription: String?
+    private var systemObservers: SystemObservers?
+    private var lastHotkeyDownAt: Date?
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
+        Logger.shared.log("lifecycle", "applicationDidFinishLaunching")
         statusBar = StatusBarController()
         recorder = AudioRecorder()
 
@@ -118,7 +121,11 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         transcriber.prewarmEngine()
 
         DispatchQueue.main.async { [weak self] in
-            self?.startListening()
+            guard let self = self else { return }
+            let observers = SystemObservers()
+            observers.start(currentEngine: self.recorder.liveEngine)
+            self.systemObservers = observers
+            self.startListening()
         }
     }
 
@@ -158,10 +165,17 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         let wasDownloading: Bool
         if case .downloading = statusBar.state { wasDownloading = true } else { wasDownloading = false }
         let deviceChanged = recorder.preferredDeviceID != newConfig.audioInputDeviceID
+        Logger.shared.log("config", "applyConfigChange " + logfmt([
+            ("device_changed", deviceChanged),
+            ("new_device", newConfig.audioInputDeviceID.map(String.init) ?? "nil"),
+            ("new_model", newConfig.modelSize),
+            ("new_language", newConfig.language),
+        ]))
         config = newConfig
         recorder.preferredDeviceID = config.audioInputDeviceID
         if deviceChanged {
             recorder.reload()
+            systemObservers?.updateEngine(recorder.liveEngine)
         }
         transcriber = Transcriber(modelSize: config.modelSize, language: config.language)
         transcriber.spokenPunctuation = config.spokenPunctuation?.value ?? false
@@ -215,9 +229,13 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleKeyDown() {
+        let isToggle = config?.toggleMode?.value ?? false
+        Logger.shared.log("hotkey", "down " + logfmt([
+            ("ready", isReady),
+            ("pressed", isPressed),
+            ("toggle", isToggle),
+        ]))
         guard isReady else { return }
-
-        let isToggle = config.toggleMode?.value ?? false
 
         if isToggle {
             if isPressed {
@@ -232,25 +250,36 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleKeyUp() {
-        let isToggle = config.toggleMode?.value ?? false
+        let isToggle = config?.toggleMode?.value ?? false
+        Logger.shared.log("hotkey", "up " + logfmt([
+            ("ready", isReady),
+            ("pressed", isPressed),
+            ("toggle", isToggle),
+        ]))
         if isToggle { return }
-
         handleRecordingStop()
     }
 
     private func handleRecordingStart() {
         guard !isPressed else { return }
         isPressed = true
+        lastHotkeyDownAt = Date()
+        let isTemp = Config.effectiveMaxRecordings(config.maxRecordings) == 0
+        Logger.shared.log("recording", "start_enter " + logfmt([
+            ("temp_mode", isTemp),
+        ]))
         statusBar.state = .recording
         do {
             let outputURL: URL
-            if Config.effectiveMaxRecordings(config.maxRecordings) == 0 {
+            if isTemp {
                 outputURL = RecordingStore.tempRecordingURL()
             } else {
                 outputURL = RecordingStore.newRecordingURL()
             }
             try recorder.startRecording(to: outputURL)
+            Logger.shared.log("recording", "start_ok url=\(outputURL.path)")
         } catch {
+            Logger.shared.log("recording", "start_error err=\(error.localizedDescription)")
             print("Error: \(error.localizedDescription)")
             isPressed = false
             statusBar.state = .idle
@@ -260,11 +289,19 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     private func handleRecordingStop() {
         guard isPressed else { return }
         isPressed = false
+        let downAt = lastHotkeyDownAt
+        let holdMs: Int = downAt.map { Int(Date().timeIntervalSince($0) * 1000) } ?? -1
+        Logger.shared.log("recording", "stop_enter " + logfmt([("hold_ms", holdMs)]))
 
         guard let audioURL = recorder.stopRecording() else {
+            Logger.shared.log("recording", "stop_no_url reason=recorder_returned_nil")
             statusBar.state = .idle
             return
         }
+
+        // Archive a copy independently of the user's maxRecordings setting so we
+        // always have the last 5 raw WAVs to listen back when diagnosing.
+        RecordingStore.archiveForDebug(audioURL)
 
         statusBar.state = .transcribing
 
@@ -278,17 +315,28 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
             }
             do {
                 let raw = try self.transcriber.transcribe(audioURL: audioURL)
-                var text = (self.config.spokenPunctuation?.value ?? false) ? TextPostProcessor.process(raw) : raw
-                text = TextPostProcessor.applyReplacements(text, replacements: Config.normalizedReplacements(self.config.replacements))
+                let punct = self.config.spokenPunctuation?.value ?? false
+                let afterPunct = punct ? TextPostProcessor.process(raw) : raw
+                let text = TextPostProcessor.applyReplacements(afterPunct, replacements: Config.normalizedReplacements(self.config.replacements))
+                Logger.shared.log("postprocess", "applied " + logfmt([
+                    ("punct_mode", punct),
+                    ("after_punct_len", afterPunct.count),
+                    ("final_len", text.count),
+                    ("final_is_empty", text.isEmpty),
+                ]))
                 if maxRecordings > 0 {
                     RecordingStore.prune(maxCount: maxRecordings)
                 }
                 DispatchQueue.main.async {
                     if !text.isEmpty {
                         self.lastTranscription = text
+                        Logger.shared.log("flow", "insert_branch text_len=\(text.count)")
                         self.inserter.insert(text: text)
+                    } else {
+                        Logger.shared.log("flow", "empty_branch reason=empty_text_after_postprocess")
                     }
                     self.statusBar.state = .idle
+                    Logger.shared.log("state", "-> idle")
                     self.statusBar.buildMenu()
                 }
             } catch {
@@ -296,6 +344,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
                     RecordingStore.prune(maxCount: maxRecordings)
                 }
                 DispatchQueue.main.async {
+                    Logger.shared.log("flow", "error_branch err=\(error.localizedDescription)")
                     print("Error: \(error.localizedDescription)")
                     self.statusBar.state = .error(error.localizedDescription)
                     self.statusBar.buildMenu()

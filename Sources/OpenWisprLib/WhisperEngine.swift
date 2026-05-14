@@ -30,15 +30,29 @@ final class WhisperEngine {
         params.use_gpu = true
         params.flash_attn = true
 
+        let t0 = Date()
+        Logger.shared.log("whisper", "init_start " + logfmt([
+            ("model_path", modelPath),
+            ("model_size", modelSize),
+            ("use_gpu", params.use_gpu),
+            ("flash_attn", params.flash_attn),
+        ]))
+
         // Use the no-state variant so we can allocate a fresh whisper_state for
         // each transcription. Sharing one state across calls causes residual
         // KV-cache / detected-language to leak between runs (we observed the
         // second call returning English even with language="fr" explicitly set).
         guard let ctx = modelPath.withCString({ whisper_init_from_file_with_params_no_state($0, params) }) else {
+            Logger.shared.log("whisper", "init_failed model_size=\(modelSize)")
             return nil
         }
         self.context = ctx
         self.modelSize = modelSize
+        let elapsedMs = Int(Date().timeIntervalSince(t0) * 1000)
+        Logger.shared.log("whisper", "init_done " + logfmt([
+            ("elapsed_ms", elapsedMs),
+            ("model_size", modelSize),
+        ]))
     }
 
     deinit {
@@ -67,10 +81,19 @@ final class WhisperEngine {
         params.no_context = true
         params.translate = false
 
+        let trimmedPrompt = prompt?.trimmingCharacters(in: .whitespacesAndNewlines)
+        Logger.shared.log("whisper", "transcribe_start " + logfmt([
+            ("samples", samples.count),
+            ("seconds", String(format: "%.2f", Double(samples.count) / 16000.0)),
+            ("language", language),
+            ("prompt_len", trimmedPrompt?.count ?? 0),
+            ("suppress_regex_len", suppressRegex?.count ?? 0),
+        ]))
+        let t0 = Date()
+
         return try language.withCString { langPtr -> String in
             params.language = langPtr
 
-            let trimmedPrompt = prompt?.trimmingCharacters(in: .whitespacesAndNewlines)
             let promptCString: ContiguousArray<CChar>? = (trimmedPrompt?.isEmpty == false)
                 ? ContiguousArray(trimmedPrompt!.utf8CString)
                 : nil
@@ -84,6 +107,7 @@ final class WhisperEngine {
                     params.suppress_regex = regexBuf?.baseAddress
 
                     guard let state = whisper_init_state(context) else {
+                        Logger.shared.log("whisper", "transcribe_init_state_failed")
                         throw TranscriberError.transcriptionFailed
                     }
                     defer { whisper_free_state(state) }
@@ -92,6 +116,7 @@ final class WhisperEngine {
                         whisper_full_with_state(context, state, params, buf.baseAddress, Int32(buf.count))
                     }
                     if result != 0 {
+                        Logger.shared.log("whisper", "transcribe_failed code=\(result)")
                         throw TranscriberError.transcriptionFailed
                     }
 
@@ -102,7 +127,16 @@ final class WhisperEngine {
                             output += String(cString: cstr)
                         }
                     }
-                    return output.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let elapsedMs = Int(Date().timeIntervalSince(t0) * 1000)
+                    let preview = trimmed.prefix(200)
+                    Logger.shared.log("whisper", "transcribe_done " + logfmt([
+                        ("elapsed_ms", elapsedMs),
+                        ("n_segments", nSegments),
+                        ("raw_len", trimmed.count),
+                        ("raw_preview", preview),
+                    ]))
+                    return trimmed
                 }
             }
         }
@@ -124,39 +158,81 @@ private extension Optional where Wrapped == ContiguousArray<CChar> {
 /// whisper.cpp expects. Returns samples in [-1.0, 1.0].
 enum WAVDecoder {
     static func loadAsFloat32(url: URL) throws -> [Float] {
-        let file = try AVAudioFile(forReading: url)
+        var fileSize: Int = -1
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+           let size = attrs[.size] as? Int {
+            fileSize = size
+        }
+        let file: AVAudioFile
+        do {
+            file = try AVAudioFile(forReading: url)
+        } catch {
+            Logger.shared.log("wav", "open_failed url=\(url.path) size=\(fileSize) err=\(error.localizedDescription)")
+            throw error
+        }
         let processingFormat = file.processingFormat
         let frameCount = AVAudioFrameCount(file.length)
-        guard frameCount > 0 else { return [] }
+        Logger.shared.log("wav", "open " + logfmt([
+            ("file_size", fileSize),
+            ("frame_count", file.length),
+            ("sample_rate", processingFormat.sampleRate),
+            ("channels", processingFormat.channelCount),
+            ("common_format", processingFormat.commonFormat.rawValue),
+        ]))
+        guard frameCount > 0 else {
+            Logger.shared.log("wav", "empty_file")
+            return []
+        }
 
         guard let buffer = AVAudioPCMBuffer(pcmFormat: processingFormat, frameCapacity: frameCount) else {
+            Logger.shared.log("wav", "pcm_buffer_alloc_failed")
             throw NSError(domain: "OpenWispr.WAVDecoder", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "Failed to allocate PCM buffer"])
         }
-        try file.read(into: buffer)
+        do {
+            try file.read(into: buffer)
+        } catch {
+            Logger.shared.log("wav", "read_failed err=\(error.localizedDescription)")
+            throw error
+        }
 
         guard let channels = buffer.floatChannelData else {
+            Logger.shared.log("wav", "no_float_channel_data")
             throw NSError(domain: "OpenWispr.WAVDecoder", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "PCM buffer missing float channel data"])
         }
         let count = Int(buffer.frameLength)
-
-        // Recordings are written as 16kHz mono, but be defensive: average channels
-        // if a buffer somehow arrives stereo, and verify sample rate.
         let channelCount = Int(processingFormat.channelCount)
+
+        let result: [Float]
         if channelCount == 1 {
-            return Array(UnsafeBufferPointer(start: channels[0], count: count))
+            result = Array(UnsafeBufferPointer(start: channels[0], count: count))
+        } else {
+            var mono = [Float](repeating: 0, count: count)
+            for c in 0..<channelCount {
+                let ch = channels[c]
+                for i in 0..<count {
+                    mono[i] += ch[i]
+                }
+            }
+            let inv = 1.0 / Float(channelCount)
+            for i in 0..<count { mono[i] *= inv }
+            result = mono
         }
 
-        var mono = [Float](repeating: 0, count: count)
-        for c in 0..<channelCount {
-            let ch = channels[c]
-            for i in 0..<count {
-                mono[i] += ch[i]
-            }
+        var peak: Float = 0
+        var sum: Double = 0
+        for v in result {
+            let a = v < 0 ? -v : v
+            if a > peak { peak = a }
+            sum += Double(v) * Double(v)
         }
-        let inv = 1.0 / Float(channelCount)
-        for i in 0..<count { mono[i] *= inv }
-        return mono
+        let rms = result.isEmpty ? 0 : (sum / Double(result.count)).squareRoot()
+        Logger.shared.log("wav", "decoded " + logfmt([
+            ("samples", result.count),
+            ("peak", String(format: "%.5f", peak)),
+            ("rms", String(format: "%.5f", rms)),
+        ]))
+        return result
     }
 }

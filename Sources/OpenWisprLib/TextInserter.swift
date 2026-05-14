@@ -11,16 +11,21 @@ class TextInserter {
     }
 
     func insert(text: String) {
+        Logger.shared.log("insert", "enter " + logfmt([("text_len", text.count)]))
         let pasteboard = NSPasteboard.general
         let savedItems = savePasteboard(pasteboard)
+        Logger.shared.log("insert", "pasteboard_saved items=\(savedItems.count)")
 
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
+        Logger.shared.log("insert", "pasteboard_set_text")
 
         simulatePaste()
+        Logger.shared.log("insert", "simulate_paste_posted key_code=\(pasteKeyCode)")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             self.restorePasteboard(pasteboard, items: savedItems)
+            Logger.shared.log("insert", "pasteboard_restored")
         }
     }
 

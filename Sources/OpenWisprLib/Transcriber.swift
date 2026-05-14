@@ -33,9 +33,13 @@ public class Transcriber {
         if engineInitTried { return nil }
         engineInitTried = true
 
-        guard let modelPath = Transcriber.findModel(modelSize: modelSize) else { return nil }
+        guard let modelPath = Transcriber.findModel(modelSize: modelSize) else {
+            Logger.shared.log("transcriber", "ensure_engine_no_model model_size=\(modelSize)")
+            return nil
+        }
         let started = Date()
         guard let engine = WhisperEngine(modelPath: modelPath, modelSize: modelSize) else {
+            Logger.shared.log("transcriber", "ensure_engine_fallback_subprocess model_size=\(modelSize)")
             fputs("whisper engine: in-process init failed, will fall back to whisper-cli subprocess\n", Foundation.stderr)
             return nil
         }
@@ -46,10 +50,38 @@ public class Transcriber {
     }
 
     public func transcribe(audioURL: URL) throws -> String {
-        if let engine = ensureEngine() {
-            return try transcribeInProcess(engine: engine, audioURL: audioURL)
+        let t0 = Date()
+        Logger.shared.log("transcriber", "transcribe_enter " + logfmt([
+            ("url", audioURL.path),
+            ("language", language),
+            ("model_size", modelSize),
+            ("prompt_len", prompt?.count ?? 0),
+            ("spoken_punctuation", spokenPunctuation),
+        ]))
+        do {
+            let text: String
+            if let engine = ensureEngine() {
+                Logger.shared.log("transcriber", "branch=in_process")
+                text = try transcribeInProcess(engine: engine, audioURL: audioURL)
+            } else {
+                Logger.shared.log("transcriber", "branch=subprocess")
+                text = try transcribeViaSubprocess(audioURL: audioURL)
+            }
+            let elapsedMs = Int(Date().timeIntervalSince(t0) * 1000)
+            Logger.shared.log("transcriber", "transcribe_exit " + logfmt([
+                ("elapsed_ms", elapsedMs),
+                ("text_len", text.count),
+                ("text_is_empty", text.isEmpty),
+            ]))
+            return text
+        } catch {
+            let elapsedMs = Int(Date().timeIntervalSince(t0) * 1000)
+            Logger.shared.log("transcriber", "transcribe_error " + logfmt([
+                ("elapsed_ms", elapsedMs),
+                ("err", error.localizedDescription),
+            ]))
+            throw error
         }
-        return try transcribeViaSubprocess(audioURL: audioURL)
     }
 
     private func transcribeInProcess(engine: WhisperEngine, audioURL: URL) throws -> String {
@@ -60,7 +92,12 @@ public class Transcriber {
             prompt: prompt,
             suppressRegex: spokenPunctuation ? "[,\\.\\?!;:\\-—]" : nil
         )
-        return Transcriber.stripWhisperMarkers(raw)
+        let stripped = Transcriber.stripWhisperMarkers(raw)
+        Logger.shared.log("transcriber", "after_strip_markers " + logfmt([
+            ("raw_len", raw.count),
+            ("stripped_len", stripped.count),
+        ]))
+        return stripped
     }
 
     private func transcribeViaSubprocess(audioURL: URL) throws -> String {

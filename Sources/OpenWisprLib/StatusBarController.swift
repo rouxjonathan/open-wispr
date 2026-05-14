@@ -339,6 +339,10 @@ class StatusBarController: NSObject {
         openItem.target = self
         menu.addItem(openItem)
 
+        let journalItem = NSMenuItem(title: "Open Journal", action: #selector(openJournal), keyEquivalent: "j")
+        journalItem.target = self
+        menu.addItem(journalItem)
+
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
@@ -357,6 +361,16 @@ class StatusBarController: NSObject {
             try? config.save()
         }
         NSWorkspace.shared.open(configFile)
+    }
+
+    @objc private func openJournal() {
+        Logger.shared.flush()
+        let url = Logger.logFile
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: url.path) {
+            fm.createFile(atPath: url.path, contents: nil)
+        }
+        NSWorkspace.shared.open(url)
     }
 
     private func updateIcon() {
