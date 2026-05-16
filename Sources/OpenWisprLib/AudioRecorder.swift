@@ -123,6 +123,32 @@ class AudioRecorder {
             )
         }
 
+        // If the engine stopped silently between dictations (AirPods connect,
+        // default device change, sleep/wake, App Nap), the tap would install
+        // fine but receive zero buffers → empty WAV → silent failure. Restart
+        // in place — Apple's recommended response to AVAudioEngineConfiguration
+        // Change is engine.prepare() + start(), which is much cheaper than a
+        // full teardown/prewarm and preserves the inputNode the tap will
+        // attach to.
+        var didRecover = false
+        if !engine.isRunning {
+            let tRecover = Date()
+            engine.prepare()
+            do {
+                try engine.start()
+                didRecover = true
+                let elapsedMs = Int(Date().timeIntervalSince(tRecover) * 1000)
+                Logger.shared.log("recorder", "startRecording_recovered " + logfmt([
+                    ("elapsed_ms", elapsedMs),
+                    ("engine_running", engine.isRunning),
+                ]))
+            } catch {
+                Logger.shared.log("recorder", "startRecording_recover_failed err=\(error.localizedDescription)")
+                // Fall through — installTap still works, the tap just won't
+                // fire. The journal will show tap_callbacks=0 as before.
+            }
+        }
+
         let liveFormat = engine.inputNode.outputFormat(forBus: 0)
         Logger.shared.log("recorder", "startRecording_state " + logfmt([
             ("engine_running", engine.isRunning),
@@ -131,6 +157,7 @@ class AudioRecorder {
             ("live_sample_rate", liveFormat.sampleRate),
             ("live_channels", liveFormat.channelCount),
             ("did_reprewarm", didReprewarm),
+            ("did_recover", didRecover),
         ]))
 
         let recordingFormat = AVAudioFormat(
