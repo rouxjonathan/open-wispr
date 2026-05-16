@@ -35,7 +35,8 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupInner() throws {
         config = Config.load()
         inserter = TextInserter()
-        recorder.preferredDeviceID = config.audioInputDeviceID
+        validateAndPersistPreferredDevice()
+        recorder.preferredDeviceUID = config.audioInputDeviceUID
         if Config.effectiveMaxRecordings(config.maxRecordings) == 0 {
             RecordingStore.deleteAllRecordings()
         }
@@ -161,19 +162,35 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         applyConfigChange(newConfig)
     }
 
+    /// If the persisted preferred device UID no longer resolves to a present
+    /// device (unplugged, removed since last session), clear it so we fall
+    /// back to System Default instead of trying to capture from a ghost.
+    /// Returns true if the preference was cleared.
+    @discardableResult
+    private func validateAndPersistPreferredDevice() -> Bool {
+        guard let uid = config.audioInputDeviceUID else { return false }
+        if AudioDeviceManager.findDeviceID(byUID: uid) != nil { return false }
+        Logger.shared.log("config", "preferred_device_missing_clearing " + logfmt([
+            ("uid", uid),
+        ]))
+        config.audioInputDeviceUID = nil
+        try? config.save()
+        return true
+    }
+
     func applyConfigChange(_ newConfig: Config) {
         guard isReady else { return }
         let wasDownloading: Bool
         if case .downloading = statusBar.state { wasDownloading = true } else { wasDownloading = false }
-        let deviceChanged = recorder.preferredDeviceID != newConfig.audioInputDeviceID
+        let deviceChanged = recorder.preferredDeviceUID != newConfig.audioInputDeviceUID
         Logger.shared.log("config", "applyConfigChange " + logfmt([
             ("device_changed", deviceChanged),
-            ("new_device", newConfig.audioInputDeviceID.map(String.init) ?? "nil"),
+            ("new_device_uid", newConfig.audioInputDeviceUID ?? "nil"),
             ("new_model", newConfig.modelSize),
             ("new_language", newConfig.language),
         ]))
         config = newConfig
-        recorder.preferredDeviceID = config.audioInputDeviceID
+        recorder.preferredDeviceUID = config.audioInputDeviceUID
         if deviceChanged {
             recorder.reload()
             systemObservers?.updateEngine(recorder.liveEngine)
@@ -261,6 +278,34 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         handleRecordingStop()
     }
 
+    private static let audioFileExtensions: Set<String> = ["wav", "mp3", "aiff", "aif", "m4a", "caf", "flac"]
+
+    private func playFeedbackSound() {
+        guard let name = config.audioFeedback,
+              !name.isEmpty,
+              name.lowercased() != "off"
+        else { return }
+        let volume = Float(min(max(config.audioFeedbackVolume ?? 0.5, 0.0), 1.0))
+        let ext = (name as NSString).pathExtension.lowercased()
+        let sound: NSSound?
+        if Self.audioFileExtensions.contains(ext) {
+            let url: URL
+            if name.hasPrefix("/") {
+                url = URL(fileURLWithPath: name)
+            } else if name.hasPrefix("~") {
+                url = URL(fileURLWithPath: (name as NSString).expandingTildeInPath)
+            } else {
+                url = Config.configDir.appendingPathComponent(name)
+            }
+            sound = NSSound(contentsOf: url, byReference: true)
+        } else {
+            sound = NSSound(named: NSSound.Name(name))
+        }
+        guard let sound else { return }
+        sound.volume = volume
+        sound.play()
+    }
+
     private func handleRecordingStart() {
         guard !isPressed else { return }
         isPressed = true
@@ -273,7 +318,15 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
             ("id", id),
             ("temp_mode", isTemp),
         ]))
+        if validateAndPersistPreferredDevice() {
+            // Device disappeared since last prewarm; rebuild engine on System Default
+            // before recording so we don't capture from a stale device.
+            recorder.preferredDeviceUID = nil
+            recorder.reload()
+            DispatchQueue.main.async { [weak self] in self?.statusBar.buildMenu() }
+        }
         statusBar.state = .recording
+        playFeedbackSound()
         do {
             let outputURL: URL
             if isTemp {

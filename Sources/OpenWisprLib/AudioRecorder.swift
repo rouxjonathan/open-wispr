@@ -7,7 +7,9 @@ class AudioRecorder {
     private var inputFormat: AVAudioFormat?
     private var isRecording = false
     private var currentOutputURL: URL?
-    var preferredDeviceID: AudioDeviceID?
+    /// Stable UID for the user's preferred input device. nil means "follow system default".
+    /// AudioDeviceIDs are reassigned on each boot, so we resolve UID → ID at prewarm time.
+    var preferredDeviceUID: String?
 
     // Tap-callback aggregates for the current recording. Reset on each
     // startRecording, summarized at stopRecording.
@@ -39,15 +41,29 @@ class AudioRecorder {
         let engine = AVAudioEngine()
 
         let systemDefault = AudioDeviceManager.getDefaultInputDeviceID()
-        if let deviceID = preferredDeviceID, deviceID != systemDefault {
-            Logger.shared.log("recorder", "prewarm_setInputDevice " + logfmt([
-                ("requested", deviceID),
-                ("system_default", systemDefault),
-            ]))
-            setInputDevice(deviceID, on: engine)
+        if let uid = preferredDeviceUID {
+            if let deviceID = AudioDeviceManager.findDeviceID(byUID: uid) {
+                if deviceID != systemDefault {
+                    Logger.shared.log("recorder", "prewarm_setInputDevice " + logfmt([
+                        ("uid", uid),
+                        ("resolved_id", deviceID),
+                        ("system_default", systemDefault),
+                    ]))
+                    setInputDevice(deviceID, on: engine)
+                } else {
+                    Logger.shared.log("recorder", "prewarm_uid_matches_default " + logfmt([
+                        ("uid", uid),
+                        ("system_default", systemDefault),
+                    ]))
+                }
+            } else {
+                Logger.shared.log("recorder", "prewarm_uid_unresolved_fallback_default " + logfmt([
+                    ("uid", uid),
+                    ("system_default", systemDefault),
+                ]))
+            }
         } else {
             Logger.shared.log("recorder", "prewarm_useDefault " + logfmt([
-                ("preferred", preferredDeviceID.map(String.init) ?? "nil"),
                 ("system_default", systemDefault),
             ]))
         }
@@ -93,7 +109,7 @@ class AudioRecorder {
         inputFormat = nil
     }
 
-    /// Re-prewarm with the current preferredDeviceID. Use after a config change.
+    /// Re-prewarm with the current preferredDeviceUID. Use after a config change.
     func reload() {
         Logger.shared.log("recorder", "reload")
         teardown()

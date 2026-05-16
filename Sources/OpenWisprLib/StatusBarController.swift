@@ -233,10 +233,10 @@ class StatusBarController: NSObject {
         menu.addItem(modelItem)
 
         let devices = AudioDeviceManager.listInputDevices()
-        let selectedDeviceID = config.audioInputDeviceID
+        let selectedUID = config.audioInputDeviceUID
         let currentDeviceName: String
-        if let selectedID = selectedDeviceID,
-           let device = devices.first(where: { $0.id == selectedID }) {
+        if let uid = selectedUID,
+           let device = devices.first(where: { $0.uid == uid }) {
             currentDeviceName = device.name
         } else {
             currentDeviceName = "System Default"
@@ -247,14 +247,16 @@ class StatusBarController: NSObject {
 
         let defaultTarget = MenuItemTarget { [weak self] in
             var cfg = Config.load()
-            cfg.audioInputDeviceID = nil
+            cfg.audioInputDeviceUID = nil
             try? cfg.save()
             self?.onConfigChange?(cfg)
         }
         menuItemTargets.append(defaultTarget)
         let defaultItem = NSMenuItem(title: "System Default", action: #selector(MenuItemTarget.invoke), keyEquivalent: "")
         defaultItem.target = defaultTarget
-        if selectedDeviceID == nil { defaultItem.state = .on }
+        if selectedUID == nil || devices.first(where: { $0.uid == selectedUID }) == nil {
+            defaultItem.state = .on
+        }
         audioSubmenu.addItem(defaultItem)
 
         if !devices.isEmpty {
@@ -264,14 +266,14 @@ class StatusBarController: NSObject {
         for device in devices {
             let target = MenuItemTarget { [weak self] in
                 var cfg = Config.load()
-                cfg.audioInputDeviceID = device.id
+                cfg.audioInputDeviceUID = device.uid
                 try? cfg.save()
                 self?.onConfigChange?(cfg)
             }
             menuItemTargets.append(target)
             let item = NSMenuItem(title: device.name, action: #selector(MenuItemTarget.invoke), keyEquivalent: "")
             item.target = target
-            if selectedDeviceID == device.id { item.state = .on }
+            if selectedUID == device.uid { item.state = .on }
             audioSubmenu.addItem(item)
         }
 

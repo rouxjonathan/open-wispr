@@ -13,9 +13,94 @@ public struct Config: Codable {
     public var spokenPunctuation: FlexBool?
     public var maxRecordings: Int?
     public var toggleMode: FlexBool?
-    public var audioInputDeviceID: UInt32?
+    public var audioInputDeviceUID: String?
+    public var audioFeedback: String?
+    public var audioFeedbackVolume: Double?
     public var prompt: String?
     public var replacements: [[String]]?
+
+    public init(
+        hotkey: HotkeyConfig,
+        modelPath: String?,
+        modelSize: String,
+        language: String,
+        spokenPunctuation: FlexBool?,
+        maxRecordings: Int?,
+        toggleMode: FlexBool?,
+        audioInputDeviceUID: String?,
+        audioFeedback: String?,
+        audioFeedbackVolume: Double?,
+        prompt: String?,
+        replacements: [[String]]?
+    ) {
+        self.hotkey = hotkey
+        self.modelPath = modelPath
+        self.modelSize = modelSize
+        self.language = language
+        self.spokenPunctuation = spokenPunctuation
+        self.maxRecordings = maxRecordings
+        self.toggleMode = toggleMode
+        self.audioInputDeviceUID = audioInputDeviceUID
+        self.audioFeedback = audioFeedback
+        self.audioFeedbackVolume = audioFeedbackVolume
+        self.prompt = prompt
+        self.replacements = replacements
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case hotkey, modelPath, modelSize, language, spokenPunctuation
+        case maxRecordings, toggleMode
+        case audioInputDeviceUID
+        // Legacy: pre-0.38 stored transient CoreAudio AudioDeviceID (UInt32),
+        // which is reassigned on every reboot. Decoded once and migrated to UID;
+        // never re-encoded.
+        case audioInputDeviceID
+        case audioFeedback, audioFeedbackVolume, prompt, replacements
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        hotkey = try c.decode(HotkeyConfig.self, forKey: .hotkey)
+        modelPath = try c.decodeIfPresent(String.self, forKey: .modelPath)
+        modelSize = try c.decode(String.self, forKey: .modelSize)
+        language = try c.decode(String.self, forKey: .language)
+        spokenPunctuation = try c.decodeIfPresent(FlexBool.self, forKey: .spokenPunctuation)
+        maxRecordings = try c.decodeIfPresent(Int.self, forKey: .maxRecordings)
+        toggleMode = try c.decodeIfPresent(FlexBool.self, forKey: .toggleMode)
+        if let uid = try c.decodeIfPresent(String.self, forKey: .audioInputDeviceUID) {
+            audioInputDeviceUID = uid
+        } else if let legacyID = try c.decodeIfPresent(UInt32.self, forKey: .audioInputDeviceID) {
+            audioInputDeviceUID = AudioDeviceManager.getDeviceUID(deviceID: legacyID)
+        } else {
+            audioInputDeviceUID = nil
+        }
+        audioFeedback = try c.decodeIfPresent(String.self, forKey: .audioFeedback)
+        audioFeedbackVolume = try c.decodeIfPresent(Double.self, forKey: .audioFeedbackVolume)
+        prompt = try c.decodeIfPresent(String.self, forKey: .prompt)
+        replacements = try c.decodeIfPresent([[String]].self, forKey: .replacements)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(hotkey, forKey: .hotkey)
+        try c.encodeIfPresent(modelPath, forKey: .modelPath)
+        try c.encode(modelSize, forKey: .modelSize)
+        try c.encode(language, forKey: .language)
+        try c.encodeIfPresent(spokenPunctuation, forKey: .spokenPunctuation)
+        try c.encodeIfPresent(maxRecordings, forKey: .maxRecordings)
+        try c.encodeIfPresent(toggleMode, forKey: .toggleMode)
+        try c.encodeIfPresent(audioInputDeviceUID, forKey: .audioInputDeviceUID)
+        try c.encodeIfPresent(audioFeedback, forKey: .audioFeedback)
+        try c.encodeIfPresent(audioFeedbackVolume, forKey: .audioFeedbackVolume)
+        try c.encodeIfPresent(prompt, forKey: .prompt)
+        try c.encodeIfPresent(replacements, forKey: .replacements)
+    }
+
+    public static let supportedAudioFeedbackSounds: [String] = [
+        "off",
+        "Tink", "Pop", "Glass", "Hero", "Submarine", "Purr",
+        "Bottle", "Frog", "Morse", "Ping", "Funk", "Blow", "Basso",
+    ]
 
     public static let promptTokenLimit: Int = 224
     public static let promptTokenWarnThreshold: Int = 200
@@ -181,7 +266,9 @@ public struct Config: Codable {
         spokenPunctuation: FlexBool(false),
         maxRecordings: nil,
         toggleMode: FlexBool(false),
-        audioInputDeviceID: nil,
+        audioInputDeviceUID: nil,
+        audioFeedback: nil,
+        audioFeedbackVolume: nil,
         prompt: "Claude, Anthropic, Cursor, Codex, MCP, TypeScript, npm, GitHub",
         replacements: [
             ["cloud code", "Claude code"],
@@ -208,9 +295,19 @@ public struct Config: Codable {
 
         do {
             var config = try JSONDecoder().decode(Config.self, from: data)
+            var dirty = false
             let resolved = Config.resolveModelAlias(config.modelSize)
             if resolved != config.modelSize {
                 config.modelSize = resolved
+                dirty = true
+            }
+            // Purge legacy audioInputDeviceID key from on-disk JSON after the
+            // decoder has migrated it (or discarded it as unresolvable).
+            if let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               raw["audioInputDeviceID"] != nil {
+                dirty = true
+            }
+            if dirty {
                 try? config.save()
             }
             return config
@@ -231,7 +328,17 @@ public struct Config: Codable {
         let encoder = JSONEncoder()
         encoder.outputFormatting = .prettyPrinted
         let data = try encoder.encode(self)
-        try data.write(to: Config.configFile)
+        let formatted = Config.collapseStringPairArrays(in: data)
+        try formatted.write(to: Config.configFile)
+    }
+
+    static func collapseStringPairArrays(in data: Data) -> Data {
+        guard let json = String(data: data, encoding: .utf8) else { return data }
+        let pattern = #"\[\s*("(?:[^"\\]|\\.)*")\s*,\s*("(?:[^"\\]|\\.)*")\s*\]"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return data }
+        let range = NSRange(json.startIndex..., in: json)
+        let collapsed = regex.stringByReplacingMatches(in: json, range: range, withTemplate: "[ $1, $2 ]")
+        return Data(collapsed.utf8)
     }
 }
 

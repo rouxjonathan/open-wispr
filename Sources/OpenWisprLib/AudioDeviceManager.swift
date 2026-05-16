@@ -3,6 +3,7 @@ import Foundation
 
 struct AudioInputDevice {
     let id: AudioDeviceID
+    let uid: String
     let name: String
     let isDefault: Bool
 }
@@ -41,14 +42,38 @@ class AudioDeviceManager {
         for deviceID in deviceIDs {
             guard hasInputStreams(deviceID: deviceID),
                   !isVirtualDevice(deviceID: deviceID),
-                  let name = getDeviceName(deviceID: deviceID) else { continue }
+                  let name = getDeviceName(deviceID: deviceID),
+                  let uid = getDeviceUID(deviceID: deviceID) else { continue }
             result.append(AudioInputDevice(
                 id: deviceID,
+                uid: uid,
                 name: name,
                 isDefault: deviceID == defaultID
             ))
         }
         return result
+    }
+
+    /// Resolve a stable UID (e.g. "AppleHDAEngineInput:1B,0,1,1:1") back to the
+    /// AudioDeviceID assigned in the current CoreAudio session. Returns nil if
+    /// the device is not currently plugged in / recognized.
+    static func findDeviceID(byUID uid: String) -> AudioDeviceID? {
+        return listInputDevices().first(where: { $0.uid == uid })?.id
+    }
+
+    /// Fetch the persistent UID for a given AudioDeviceID. UIDs survive
+    /// reboots, unlike AudioDeviceIDs which are reassigned each boot.
+    static func getDeviceUID(deviceID: AudioDeviceID) -> String? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var uid: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &uid)
+        guard status == noErr, let cfUID = uid?.takeRetainedValue() else { return nil }
+        return cfUID as String
     }
 
     static func getDefaultInputDeviceID() -> AudioDeviceID {
