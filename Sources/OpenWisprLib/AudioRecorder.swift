@@ -10,6 +10,11 @@ class AudioRecorder {
     /// Stable UID for the user's preferred input device. nil means "follow system default".
     /// AudioDeviceIDs are reassigned on each boot, so we resolve UID → ID at prewarm time.
     var preferredDeviceUID: String?
+    /// The CoreAudio device the live engine is actually bound to, captured at
+    /// prewarm. AVAudioEngine binds its input node once, at creation, and never
+    /// follows later system-default changes — so we compare this against the
+    /// current target before each recording and rebuild when they diverge.
+    private var boundDeviceID: AudioDeviceID?
 
     // Tap-callback aggregates for the current recording. Reset on each
     // startRecording, summarized at stopRecording.
@@ -28,6 +33,20 @@ class AudioRecorder {
     /// instrumentation that reports `engine.isRunning`).
     var liveEngine: AVAudioEngine? { audioEngine }
 
+    /// True between startRecording and stopRecording. Callers use it to defer
+    /// an engine rebuild instead of yanking the tap out from under a dictation.
+    var isCapturing: Bool { isRecording }
+
+    /// The device we should be capturing from right now: the preferred one if
+    /// it is currently plugged in, otherwise whatever CoreAudio reports as the
+    /// system default input.
+    private func currentTargetDeviceID() -> AudioDeviceID {
+        if let uid = preferredDeviceUID, let deviceID = AudioDeviceManager.findDeviceID(byUID: uid) {
+            return deviceID
+        }
+        return AudioDeviceManager.getDefaultInputDeviceID()
+    }
+
     /// Bring the audio engine online and keep it running. Subsequent
     /// startRecording calls only need to install a tap, which is cheap;
     /// the ~600ms cost of engine.start() is paid once at app launch.
@@ -41,8 +60,10 @@ class AudioRecorder {
         let engine = AVAudioEngine()
 
         let systemDefault = AudioDeviceManager.getDefaultInputDeviceID()
+        var bound = systemDefault
         if let uid = preferredDeviceUID {
             if let deviceID = AudioDeviceManager.findDeviceID(byUID: uid) {
+                bound = deviceID
                 if deviceID != systemDefault {
                     Logger.shared.log("recorder", "prewarm_setInputDevice " + logfmt([
                         ("uid", uid),
@@ -86,10 +107,12 @@ class AudioRecorder {
 
         audioEngine = engine
         inputFormat = format
+        boundDeviceID = bound
         let elapsedMs = Int(Date().timeIntervalSince(t0) * 1000)
         Logger.shared.log("recorder", "prewarm_done " + logfmt([
             ("elapsed_ms", elapsedMs),
             ("engine_running", engine.isRunning),
+            ("bound_device", bound),
         ]))
     }
 
@@ -107,6 +130,7 @@ class AudioRecorder {
         audioEngine?.stop()
         audioEngine = nil
         inputFormat = nil
+        boundDeviceID = nil
     }
 
     /// Re-prewarm with the current preferredDeviceUID. Use after a config change.
@@ -128,6 +152,21 @@ class AudioRecorder {
             Logger.shared.log("recorder", "startRecording_prewarm_needed")
             prewarm()
             didReprewarm = true
+        } else if let bound = boundDeviceID {
+            // The input node is welded to the device it was created with. If the
+            // system default moved (AirPods connected, dock unplugged) the node
+            // is now pointing at the wrong — possibly dead — hardware, and its
+            // reported format is stale. Rebuild rather than record silence.
+            let target = currentTargetDeviceID()
+            if target != bound {
+                Logger.shared.log("recorder", "startRecording_device_moved " + logfmt([
+                    ("bound_device", bound),
+                    ("target_device", target),
+                ]))
+                teardown()
+                prewarm()
+                didReprewarm = true
+            }
         }
 
         guard let engine = audioEngine, let inputFmt = inputFormat else {
@@ -172,9 +211,25 @@ class AudioRecorder {
             ("cached_channels", inputFmt.channelCount),
             ("live_sample_rate", liveFormat.sampleRate),
             ("live_channels", liveFormat.channelCount),
+            ("bound_device", boundDeviceID ?? 0),
             ("did_reprewarm", didReprewarm),
             ("did_recover", didRecover),
         ]))
+
+        guard liveFormat.sampleRate > 0, liveFormat.channelCount > 0 else {
+            Logger.shared.log("recorder", "startRecording_failed reason=invalid_input_format " + logfmt([
+                ("sample_rate", liveFormat.sampleRate),
+                ("channels", liveFormat.channelCount),
+            ]))
+            throw NSError(
+                domain: "OpenWispr.AudioRecorder",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Audio input device reported an unusable format"]
+            )
+        }
+        // The live format is the truth from here on; the cached one may predate
+        // a device change.
+        inputFormat = liveFormat
 
         let recordingFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
@@ -200,26 +255,39 @@ class AudioRecorder {
             throw error
         }
 
-        guard let converter = AVAudioConverter(from: inputFmt, to: recordingFormat) else {
-            Logger.shared.log("recorder", "startRecording_converter_failed in_sr=\(inputFmt.sampleRate) in_ch=\(inputFmt.channelCount)")
-            throw NSError(
-                domain: "OpenWispr.AudioRecorder",
-                code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "Could not create audio converter"]
-            )
-        }
-
         resetTapStats()
 
-        engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFmt) { [weak self] buffer, _ in
+        // Built lazily from the first buffer's own format, and rebuilt if that
+        // format ever changes mid-recording. Deriving it from the buffer rather
+        // than from a snapshot taken before installTap keeps the converter in
+        // sync with whatever the hardware actually delivers.
+        var converter: AVAudioConverter?
+
+        // format: nil tells AVAudioEngine to use the input node's own format.
+        // Passing an explicit format that disagrees with the hardware raises an
+        // Objective-C exception that AppKit swallows mid-call, leaving the
+        // recording half-started and silent.
+        engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, _ in
             guard let self = self else { return }
 
-            let convertedBuffer = AVAudioPCMBuffer(
+            if converter == nil || converter?.inputFormat != buffer.format {
+                converter = AVAudioConverter(from: buffer.format, to: recordingFormat)
+            }
+            guard let converter = converter, buffer.frameLength > 0 else {
+                self.tapConverterErrors += 1
+                return
+            }
+
+            let capacity = AVAudioFrameCount(
+                max(1.0, Double(buffer.frameLength) * 16000.0 / buffer.format.sampleRate)
+            )
+            guard let convertedBuffer = AVAudioPCMBuffer(
                 pcmFormat: recordingFormat,
-                frameCapacity: AVAudioFrameCount(
-                    Double(buffer.frameLength) * 16000.0 / inputFmt.sampleRate
-                )
-            )!
+                frameCapacity: capacity
+            ) else {
+                self.tapConverterErrors += 1
+                return
+            }
 
             var error: NSError?
             converter.convert(to: convertedBuffer, error: &error) { _, outStatus in

@@ -13,6 +13,8 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     private var systemObservers: SystemObservers?
     private var lastHotkeyDownAt: Date?
     private var currentDictationID: String?
+    /// Set when the audio hardware changes mid-dictation; consumed at stop.
+    private var pendingAudioRebuild = false
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
         Logger.shared.log("lifecycle", "applicationDidFinishLaunching")
@@ -125,6 +127,9 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             let observers = SystemObservers()
+            observers.onAudioEnvironmentChanged = { [weak self] reason in
+                self?.handleAudioEnvironmentChange(reason)
+            }
             observers.start(currentEngine: self.recorder.liveEngine)
             self.systemObservers = observers
             self.startListening()
@@ -176,6 +181,34 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         config.audioInputDeviceUID = nil
         try? config.save()
         return true
+    }
+
+    /// The audio hardware changed under us. AVAudioEngine binds its input node
+    /// to one device for the engine's lifetime, so the only reliable response is
+    /// to rebuild it — otherwise the next dictation captures from a device that
+    /// is no longer there and comes back empty.
+    private func handleAudioEnvironmentChange(_ reason: String) {
+        guard isReady else { return }
+        Logger.shared.log("audio", "environment_changed " + logfmt([
+            ("reason", reason),
+            ("capturing", recorder.isCapturing),
+        ]))
+        guard !recorder.isCapturing else {
+            // Don't pull the tap out from under a dictation in flight; rebuild
+            // once it finishes.
+            pendingAudioRebuild = true
+            return
+        }
+        rebuildAudioEngine()
+    }
+
+    private func rebuildAudioEngine() {
+        // The preferred device may have just been unplugged, or reappeared.
+        validateAndPersistPreferredDevice()
+        recorder.preferredDeviceUID = config.audioInputDeviceUID
+        recorder.reload()
+        systemObservers?.updateEngine(recorder.liveEngine)
+        statusBar.buildMenu()
     }
 
     func applyConfigChange(_ newConfig: Config) {
@@ -361,7 +394,17 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
             ("hold_ms", holdMs),
         ]))
 
-        guard let audioURL = recorder.stopRecording() else {
+        let stoppedURL = recorder.stopRecording()
+
+        if pendingAudioRebuild {
+            pendingAudioRebuild = false
+            Logger.shared.log("audio", "deferred_rebuild_after_recording")
+            // Async so the rebuild doesn't sit between us and dispatching the
+            // transcription.
+            DispatchQueue.main.async { [weak self] in self?.rebuildAudioEngine() }
+        }
+
+        guard let audioURL = stoppedURL else {
             Logger.shared.log("recording", "stop_no_url " + logfmt([
                 ("id", id),
                 ("reason", "recorder_returned_nil"),

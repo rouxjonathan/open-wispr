@@ -1,0 +1,8 @@
+
+
+swift run open-wispr start
+
+
+rm -rf ./.build/release && swift build -c release
+
+launchctl kickstart -k gui/$(id -u)/com.open-wispr.start

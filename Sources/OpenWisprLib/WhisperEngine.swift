@@ -75,7 +75,11 @@ final class WhisperEngine {
         params.print_realtime = false
         params.print_special = false
         params.print_timestamps = false
-        params.no_timestamps = true
+        // Keep timestamp tokens enabled: with no_timestamps, whisper.cpp always
+        // advances the 30s window in full even when the decoder stopped early
+        // (frequent on repetitive speech), silently dropping the audio in
+        // between. Timestamps let it resume where the text actually ended.
+        params.no_timestamps = false
         params.single_segment = false
         params.suppress_blank = true
         params.no_context = true

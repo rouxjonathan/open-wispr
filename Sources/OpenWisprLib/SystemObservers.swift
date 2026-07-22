@@ -3,14 +3,23 @@ import AVFoundation
 import CoreAudio
 import Foundation
 
-/// Subscribes to OS notifications that can affect audio capture and just logs
-/// them. No behavior change — instrumentation only, so we can correlate a
-/// failed dictation in the journal with a system event around the same time.
+/// Subscribes to OS notifications that can affect audio capture. Most are logged
+/// only, so we can correlate a failed dictation in the journal with a system
+/// event around the same time. The CoreAudio hardware listeners additionally
+/// drive `onAudioEnvironmentChanged`, which is what keeps the engine and the
+/// device menu in sync when hardware comes and goes.
 final class SystemObservers {
     private weak var audioEngine: AVAudioEngine?
     private var defaultDeviceListenerInstalled = false
+    private var deviceListListenerInstalled = false
     private var deviceAliveListenerInstalled = false
     private var watchedDeviceID: AudioDeviceID = 0
+    private var coalesceWorkItem: DispatchWorkItem?
+
+    /// Called on the main queue after the audio hardware landscape changes
+    /// (device plugged/unplugged, system default input moved). Coalesced —
+    /// connecting a single Bluetooth device emits a burst of notifications.
+    var onAudioEnvironmentChanged: ((String) -> Void)?
 
     func start(currentEngine: AVAudioEngine?) {
         audioEngine = currentEngine
@@ -55,6 +64,23 @@ final class SystemObservers {
 
     func updateEngine(_ engine: AVAudioEngine?) {
         audioEngine = engine
+    }
+
+    /// Debounce a burst of hardware notifications into one callback. CoreAudio
+    /// listeners fire on a background queue; the callback always lands on main.
+    private func scheduleEnvironmentChange(reason: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.coalesceWorkItem?.cancel()
+            let item = DispatchWorkItem { [weak self] in
+                self?.onAudioEnvironmentChanged?(reason)
+            }
+            self.coalesceWorkItem = item
+            // Generous window: connecting a Bluetooth headset emits the device
+            // list change and the default-input change up to a second apart,
+            // and rebuilding twice would cycle the mic indicator for nothing.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: item)
+        }
     }
 
     // MARK: - AVAudioEngine
@@ -109,14 +135,38 @@ final class SystemObservers {
             AudioObjectID(kAudioObjectSystemObject),
             &defaultAddress,
             DispatchQueue.global(qos: .utility)
-        ) { _, _ in
+        ) { [weak self] _, _ in
             let newID = AudioDeviceManager.getDefaultInputDeviceID()
             Logger.shared.log("system", "defaultInputDeviceChanged " + logfmt([("new_id", newID)]))
+            self?.scheduleEnvironmentChange(reason: "default_input_changed")
         }
         if defaultStatus == noErr {
             defaultDeviceListenerInstalled = true
         } else {
             Logger.shared.log("system", "defaultInputDeviceListener_failed status=\(defaultStatus)")
+        }
+
+        // Fires when any device appears or disappears — this is what makes a
+        // freshly connected mic show up in the menu without the user having to
+        // poke the list to force a rebuild.
+        var devicesAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let devicesStatus = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &devicesAddress,
+            DispatchQueue.global(qos: .utility)
+        ) { [weak self] _, _ in
+            let count = AudioDeviceManager.listInputDevices().count
+            Logger.shared.log("system", "deviceListChanged " + logfmt([("input_devices", count)]))
+            self?.scheduleEnvironmentChange(reason: "device_list_changed")
+        }
+        if devicesStatus == noErr {
+            deviceListListenerInstalled = true
+        } else {
+            Logger.shared.log("system", "deviceListListener_failed status=\(devicesStatus)")
         }
 
         let deviceID = AudioDeviceManager.getDefaultInputDeviceID()
