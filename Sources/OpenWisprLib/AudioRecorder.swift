@@ -7,6 +7,15 @@ class AudioRecorder {
     private var inputFormat: AVAudioFormat?
     private var isRecording = false
     private var currentOutputURL: URL?
+    /// The file the tap is writing into. Held here — rather than only captured
+    /// by the tap closure — so stopRecording can release it deterministically.
+    /// AVAudioFile writes the real RIFF and data chunk sizes into the header
+    /// only when it deallocates, and CoreAudio can keep the tap closure alive
+    /// past removeTap. Losing that race left a WAV holding every captured byte
+    /// while advertising zero frames, which the transcriber read as silence.
+    private var outputFile: AVAudioFile?
+    /// Guards outputFile between the real-time tap thread and stopRecording.
+    private let outputFileLock = NSLock()
     /// Stable UID for the user's preferred input device. nil means "follow system default".
     /// AudioDeviceIDs are reassigned on each boot, so we resolve UID → ID at prewarm time.
     var preferredDeviceUID: String?
@@ -127,6 +136,7 @@ class AudioRecorder {
             isRecording = false
             currentOutputURL = nil
         }
+        closeOutputFile()
         audioEngine?.stop()
         audioEngine = nil
         inputFormat = nil
@@ -247,9 +257,12 @@ class AudioRecorder {
             AVLinearPCMIsBigEndianKey: false,
         ]
 
-        let file: AVAudioFile
+        // A recording that was never stopped would otherwise keep its header
+        // unfinalized for good.
+        closeOutputFile()
+
         do {
-            file = try AVAudioFile(forWriting: outputURL, settings: settings)
+            outputFile = try AVAudioFile(forWriting: outputURL, settings: settings)
         } catch {
             Logger.shared.log("recorder", "startRecording_avfile_failed url=\(outputURL.path) err=\(error.localizedDescription)")
             throw error
@@ -318,8 +331,13 @@ class AudioRecorder {
             }
 
             if error == nil && convertedBuffer.frameLength > 0 {
+                // Reaching the file through self, under the lock, keeps the
+                // closure from holding the only strong reference to it: the
+                // header can then be finalized the moment stopRecording says so.
+                self.outputFileLock.lock()
+                defer { self.outputFileLock.unlock() }
                 do {
-                    try file.write(from: convertedBuffer)
+                    try self.outputFile?.write(from: convertedBuffer)
                 } catch {
                     self.tapWriteErrors += 1
                 }
@@ -347,6 +365,20 @@ class AudioRecorder {
         currentOutputURL = nil
 
         audioEngine?.inputNode.removeTap(onBus: 0)
+
+        // Must happen before anything reads the file back: until the header is
+        // finalized the WAV reports zero frames no matter how much audio it holds.
+        let writtenFrames = closeOutputFile()
+        var headerFrames: Int64 = -1
+        if let path = url, let reader = try? AVAudioFile(forReading: path) {
+            headerFrames = reader.length
+        }
+        if writtenFrames > 0 && headerFrames != writtenFrames {
+            Logger.shared.log("recorder", "stopRecording_header_mismatch " + logfmt([
+                ("written_frames", writtenFrames),
+                ("header_frames", headerFrames),
+            ]))
+        }
 
         let rms: Double
         if tapSampleCount > 0 {
@@ -381,10 +413,29 @@ class AudioRecorder {
             ("peak", String(format: "%.5f", tapPeak)),
             ("rms", String(format: "%.5f", rms)),
             ("file_size_bytes", fileSize),
+            ("written_frames", writtenFrames),
+            ("header_frames", headerFrames),
             ("engine_running_after_stop", audioEngine?.isRunning ?? false),
         ]))
 
         return url
+    }
+
+    /// Release the tap's AVAudioFile so its deallocation writes the real RIFF
+    /// and data chunk sizes into the WAV header. Safe to call with no recording
+    /// in flight. Returns the frames the file reported while still open, or -1
+    /// when there was no file.
+    @discardableResult
+    private func closeOutputFile() -> Int64 {
+        outputFileLock.lock()
+        let file = outputFile
+        outputFile = nil
+        outputFileLock.unlock()
+        // Deallocating outside the lock matters: finalizing the header touches
+        // the disk, and the tap runs on a real-time thread that should never
+        // wait on that. ARC releases `file` here at the latest, so the header
+        // is on disk before this returns.
+        return file.map { Int64($0.length) } ?? -1
     }
 
     private func resetTapStats() {
